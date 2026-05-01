@@ -1,7 +1,1 @@
-{
-  "functions": {
-    "api/parse-invoice.js": {
-      "maxDuration": 60
-    }
-  }
-}
+{}
