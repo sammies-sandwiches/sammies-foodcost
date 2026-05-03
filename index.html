@@ -795,6 +795,7 @@
             <div style="font-size:12px;color:#9ca3af" id="inv-meta-line">Invoice details</div>
           </div>
           <div style="display:flex;gap:8px">
+            <button onclick="viewCurrentInvoice()" class="btn" style="background:#fff;color:#1a1a1a;border:1px solid #e5e7eb;font-size:12px;padding:7px 14px">👁 View original</button>
             <button onclick="approveAllInvoiceItems()" class="btn btn-dark" style="font-size:12px;padding:7px 16px">Apply all prices</button>
             <button onclick="resetInvoiceUpload()" class="btn" style="background:#f3f4f6;color:#6b7280;font-size:12px;padding:7px 14px">Upload another</button>
           </div>
@@ -893,6 +894,21 @@
 // ── SUPABASE CONFIG — loaded from localStorage (set via in-app settings) ─────
 let sb = null;
 let currentUser = null;
+let currentRestaurantId = null;
+
+// Fetch the user's restaurant_id from profiles and cache it. Required for
+// storage uploads (tenant-scoped storage RLS expects {restaurant_id}/...).
+function loadProfileRestaurantId() {
+  if (!sb || !currentUser) return Promise.resolve(null);
+  return sb.from('profiles').select('restaurant_id').eq('id', currentUser.id).single()
+    .then(function(res) {
+      if (res.data && res.data.restaurant_id) {
+        currentRestaurantId = res.data.restaurant_id;
+      }
+      return currentRestaurantId;
+    })
+    .catch(function(e) { console.warn('Profile load failed:', e); return null; });
+}
 
 function initSupabase() {
   var url = localStorage.getItem('sb_url');
@@ -1013,8 +1029,10 @@ function checkAuth() {
       currentUser = session.user;
       document.getElementById('user-email').textContent = currentUser.email;
       document.getElementById('logout-btn').style.display='block';
-      showApp();
-      syncFromSupabase();
+      loadProfileRestaurantId().then(function() {
+        showApp();
+        syncFromSupabase();
+      });
     } else {
       showLogin();
     }
@@ -1050,8 +1068,10 @@ function doLogin() {
         currentUser = res.data.user;
         document.getElementById('user-email').textContent = currentUser.email;
         document.getElementById('logout-btn').style.display = 'block';
-        showApp();
-        syncFromSupabase();
+        loadProfileRestaurantId().then(function() {
+          showApp();
+          syncFromSupabase();
+        });
       }
     }).catch(function(e) {
       errEl.textContent = 'Connection error. Check your database settings.';
@@ -1094,7 +1114,9 @@ function doSignup() {
       currentUser=res.data.user;
       document.getElementById('user-email').textContent=currentUser.email;
       document.getElementById('logout-btn').style.display='block';
-      showApp(); syncFromSupabase();
+      loadProfileRestaurantId().then(function() {
+        showApp(); syncFromSupabase();
+      });
     }
   }).catch(function(e) {
     btn.textContent='Create account'; btn.disabled=false;
@@ -1104,8 +1126,8 @@ function doSignup() {
 
 function doLogout() {
   if (sb) {
-    sb.auth.signOut().then(function() { currentUser=null; showLogin(); });
-  } else { currentUser=null; showLogin(); }
+    sb.auth.signOut().then(function() { currentUser=null; currentRestaurantId=null; showLogin(); });
+  } else { currentUser=null; currentRestaurantId=null; showLogin(); }
 }
 
 // ── SYNC — push local data to Supabase after login ───────────────────────────
@@ -3319,8 +3341,6 @@ function handleInvoiceDrop(event) {
 function handleInvoiceFile(file) {
   if (!file) return;
 
-  var anthropicKey = localStorage.getItem('anthropic_key') || 'server-side';
-
   var allowed = ['application/pdf','image/jpeg','image/png','image/webp'];
   if (!allowed.includes(file.type)) {
     showInvoiceError('File type not supported. Please upload a JPG, PNG, or PDF.');
@@ -3331,12 +3351,50 @@ function handleInvoiceFile(file) {
   document.getElementById('invoice-dropzone').style.display = 'none';
   document.getElementById('invoice-parsing-status').style.display = 'block';
   document.getElementById('invoice-review').style.display = 'none';
-  setInvoiceStatus('Reading ' + file.name + ' with Claude Vision…', '⏳');
+  setInvoiceStatus('Reading ' + file.name + '…', '⏳');
 
+  // PDFs go through unchanged. Images get compressed to keep payload small.
+  if (file.type === 'application/pdf') {
+    encodeAndSend(file, file.type, file.name);
+  } else {
+    setInvoiceStatus('Compressing image…', '🗜️');
+    compressImage(file).then(function(blob) {
+      encodeAndSend(blob, 'image/jpeg', file.name);
+    }).catch(function(err) {
+      console.warn('Compression failed, sending original:', err);
+      encodeAndSend(file, file.type, file.name);
+    });
+  }
+}
+
+// Resize+re-encode large phone photos so we stay well under Vercel's body limit.
+function compressImage(file) {
+  return new Promise(function(resolve, reject) {
+    var img = new Image();
+    var url = URL.createObjectURL(file);
+    img.onload = function() {
+      URL.revokeObjectURL(url);
+      var maxEdge = 2000;             // long-edge cap; plenty for OCR
+      var w = img.naturalWidth, h = img.naturalHeight;
+      var scale = Math.min(1, maxEdge / Math.max(w, h));
+      var canvas = document.createElement('canvas');
+      canvas.width  = Math.round(w * scale);
+      canvas.height = Math.round(h * scale);
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(function(blob) {
+        if (!blob) reject(new Error('toBlob returned null'));
+        else resolve(blob);
+      }, 'image/jpeg', 0.85);
+    };
+    img.onerror = function() { URL.revokeObjectURL(url); reject(new Error('Image decode failed')); };
+    img.src = url;
+  });
+}
+
+function encodeAndSend(fileOrBlob, mediaType, displayName) {
   var reader = new FileReader();
-  reader.onerror = function() {
-    showInvoiceError('Could not read the file. Please try again.');
-  };
+  reader.onerror = function() { showInvoiceError('Could not read the file. Please try again.'); };
   reader.onload = function(e) {
     var result = e.target.result;
     if (!result || !result.includes(',')) {
@@ -3344,22 +3402,20 @@ function handleInvoiceFile(file) {
       return;
     }
     var base64 = result.split(',')[1];
-    // Store full data URL for scan upload later
+    // Stash for the View-Original modal and for storage upload after save.
     window._currentInvoiceDataUrl = result;
-    window._currentInvoiceMediaType = file.type;
-    // Check file size - Vercel body limit is ~4.5MB
+    window._currentInvoiceMediaType = mediaType;
+    window._currentInvoiceFileName = displayName;
     var sizeBytes = base64.length * 0.75;
     var sizeMB = (sizeBytes / (1024*1024)).toFixed(1);
     if (sizeBytes > 3.5 * 1024 * 1024) {
-      showInvoiceError('File is too large (' + sizeMB + 'MB). Please use a photo under 3.5MB or compress it first.');
-      document.getElementById('invoice-dropzone').style.display = 'block';
-      document.getElementById('invoice-parsing-status').style.display = 'none';
+      showInvoiceError('File is still too large (' + sizeMB + 'MB) after compression. Try a smaller photo.');
       return;
     }
-    setInvoiceStatus('Uploading (' + sizeMB + 'MB) to Claude Vision API…', '🔄');
-    parseInvoiceWithClaude(base64, file.type, anthropicKey, file.name);
+    setInvoiceStatus('Sending (' + sizeMB + 'MB) for parsing…', '🔄');
+    parseInvoiceWithClaude(base64, mediaType, displayName);
   };
-  reader.readAsDataURL(file);
+  reader.readAsDataURL(fileOrBlob);
 }
 
 function setInvoiceStatus(msg, icon) {
@@ -3386,41 +3442,44 @@ function showInvoiceError(msg) {
   errDiv.style.display = 'block';
 }
 
-function parseInvoiceWithClaude(base64Data, mediaType, apiKey, fileName) {
-  var isPdf = mediaType === 'application/pdf';
+function parseInvoiceWithClaude(base64Data, mediaType, fileName) {
+  // Get the user's session token so the server can verify identity.
+  if (!sb) {
+    showInvoiceError('Not signed in. Please sign in first.');
+    return;
+  }
+  sb.auth.getSession().then(function(s) {
+    var token = s && s.data && s.data.session && s.data.session.access_token;
+    if (!token) { showInvoiceError('Session expired. Sign in again.'); return; }
 
-  var messageContent = [
-    isPdf
-      ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Data } }
-      : { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Data } },
-    { type: 'text', text: 'Parse this restaurant food-service invoice. Return ONLY valid JSON with this structure:\n{\n"vendor_name":"string","invoice_number":"string|null","invoice_date":"string|null","total_amount":number|null,\n"line_items":[{"sku":"string|null","description":"string","quantity":number,"unit_price":number,"extended_price":number|null,"unit":"string","is_short":false,"is_credit":false,"inventory_category":"Produce|Protein|Dairy|Dry Goods|Chemical|Beverage|Bakery|Frozen|Paper/Disposables|Other"}]\n}\nNo markdown, no explanation. JSON only.' }
-  ];
-
-  fetch('/api/parse-invoice', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ base64Data: base64Data, mediaType: mediaType })
-  })
-  .then(function(res) {
-    var ct = res.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) {
-      return res.text().then(function(t){ throw new Error('Server error: ' + t.slice(0,150)); });
-    }
-    return res.json().then(function(d) {
-      if (!res.ok) throw new Error(d.error || 'HTTP ' + res.status);
-      return d;
+    fetch('/api/parse-invoice', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify({ base64Data: base64Data, mediaType: mediaType })
+    })
+    .then(function(res) {
+      var ct = res.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) {
+        return res.text().then(function(t){ throw new Error('Server error (' + res.status + '): ' + t.slice(0,150)); });
+      }
+      return res.json().then(function(d) {
+        if (!res.ok) throw new Error(d.error || ('HTTP ' + res.status));
+        return d;
+      });
+    })
+    .then(function(data) {
+      setInvoiceStatus('Processing results…', '🔍');
+      if (!data.line_items) throw new Error('No line items returned.');
+      parsedInvoiceData = data;
+      renderInvoiceReview(data, fileName);
+    })
+    .catch(function(e) {
+      console.error('Invoice parse error:', e);
+      showInvoiceError('Parse failed: ' + e.message);
     });
-  })
-  .then(function(data) {
-    setInvoiceStatus('Processing results…', '🔍');
-    if (data.error) throw new Error(data.error);
-    if (!data.line_items) throw new Error('No line items. Got: ' + JSON.stringify(data).slice(0,200));
-    parsedInvoiceData = data;
-    renderInvoiceReview(data, fileName);
-  })
-  .catch(function(e) {
-    console.error('Invoice parse error:', e);
-    showInvoiceError('Parse failed: ' + e.message);
   });
 }
 
@@ -3561,14 +3620,15 @@ function approveAllInvoiceItems() {
   // Save invoice to Supabase with scan image
   if (!sb || !parsedInvoiceData) return;
 
-  function saveInvoiceRecord(scanUrl) {
-    var rawWithScan = Object.assign({}, parsedInvoiceData, { _scan_url: scanUrl || null });
+  function saveInvoiceRecord(imagePath, imageType) {
     sb.from('invoices').insert({
       vendor: parsedInvoiceData.vendor_name || 'Unknown',
       invoice_number: parsedInvoiceData.invoice_number || null,
       invoice_date: parsedInvoiceData.invoice_date || null,
       total_amount: parsedInvoiceData.total_amount || null,
-      raw_json: rawWithScan
+      raw_json: parsedInvoiceData,
+      image_path: imagePath || null,
+      image_type: imageType || null
     }).then(function(res) {
       if (!res.error) {
         invoiceHistory.unshift({
@@ -3576,19 +3636,22 @@ function approveAllInvoiceItems() {
           date: parsedInvoiceData.invoice_date || '',
           items: items.length,
           updated: updated,
-          scanUrl: scanUrl || null
+          imagePath: imagePath || null
         });
         renderInvoiceHistory();
-        if (scanUrl) showSaveToast('Invoice + scan saved ✓', '#16a34a');
+        showSaveToast(imagePath ? 'Invoice + scan saved ✓' : 'Invoice saved (no scan)', '#16a34a');
+      } else {
+        showSaveToast('Save failed: ' + res.error.message, '#dc2626');
       }
     });
   }
 
   // Upload scan image first if available
-  if (window._currentInvoiceDataUrl && window._currentInvoiceMediaType) {
+  if (window._currentInvoiceDataUrl && window._currentInvoiceMediaType && currentRestaurantId) {
     var mediaType = window._currentInvoiceMediaType;
     var ext = mediaType === 'application/pdf' ? 'pdf' : (mediaType.split('/')[1] || 'jpg');
-    var fileName = 'invoice-' + Date.now() + '.' + ext;
+    // Tenant-scoped path — required by storage RLS.
+    var fileName = currentRestaurantId + '/invoice-' + Date.now() + '.' + ext;
     var byteStr = atob(window._currentInvoiceDataUrl.split(',')[1]);
     var arr = new Uint8Array(byteStr.length);
     for (var ii = 0; ii < byteStr.length; ii++) arr[ii] = byteStr.charCodeAt(ii);
@@ -3596,21 +3659,18 @@ function approveAllInvoiceItems() {
     sb.storage.from('invoices').upload(fileName, blob, { contentType: mediaType, upsert: true })
       .then(function(r) {
         if (r.error) {
-          showSaveToast('Scan upload failed: ' + r.error.message, '#dc2626');
           console.error('Scan upload error:', r.error);
-          saveInvoiceRecord(null);
+          showSaveToast('Scan upload failed: ' + r.error.message, '#dc2626');
+          saveInvoiceRecord(null, null);
           return;
         }
-        var publicUrl = sb.storage.from('invoices').getPublicUrl(fileName).data.publicUrl;
-        console.log('Scan uploaded:', publicUrl);
-        saveInvoiceRecord(publicUrl);
+        saveInvoiceRecord(fileName, mediaType);
       }).catch(function(e) {
-        showSaveToast('Scan upload error: ' + e.message, '#dc2626');
         console.error('Scan upload catch:', e);
-        saveInvoiceRecord(null);
+        saveInvoiceRecord(null, null);
       });
   } else {
-    saveInvoiceRecord(null);
+    saveInvoiceRecord(null, null);
   }
 }
 
@@ -3631,17 +3691,42 @@ function linkInvoiceItem(idx, ingId) {
 
 function addAsNewIngredient(idx) {
   var item = parsedInvoiceData.line_items[idx];
-  var newId = Math.max.apply(null, ING.map(function(i){ return i.id; })) + 1;
-  var newIng = {
-    id: newId, sku: item.sku || '—', name: item.description,
+  var price = parseFloat(item.unit_price) || 0;
+  var payload = {
+    sku: item.sku || '—',
+    name: item.description,
     vendor: parsedInvoiceData.vendor_name || 'Market',
-    cat: item.inventory_category || 'Other', unit: item.unit || 'each',
-    price: parseFloat(item.unit_price), prev: parseFloat(item.unit_price), _edited: true
+    category: item.inventory_category || 'Other',
+    unit: item.unit || 'each',
+    price: price,
+    prev_price: price,
+    edited: true
   };
-  ING.push(newIng);
-  saveIngredientToDb(newIng);
-  showSaveToast(newIng.name + ' added to catalog', '#16a34a');
-  renderIngredients && renderIngredients();
+  // Offline fallback: client-side ID. With Supabase, let the DB assign — picking
+  // max+1 from the local view collides with other tenants' rows globally.
+  if (!sb) {
+    var fallbackId = (ING.length ? Math.max.apply(null, ING.map(function(i){ return i.id; })) : 0) + 1;
+    ING.push(Object.assign({ id: fallbackId, cat: payload.category, prev: price, _edited: true }, {
+      sku: payload.sku, name: payload.name, vendor: payload.vendor, unit: payload.unit, price: price
+    }));
+    showSaveToast(payload.name + ' added (offline)', '#d97706');
+    renderIngredients && renderIngredients();
+    return;
+  }
+  sb.from('ingredients').insert(payload).select().single().then(function(res) {
+    if (res.error) { showSaveToast('Add failed: ' + res.error.message, '#dc2626'); return; }
+    var row = res.data;
+    ING.push({
+      id: row.id, sku: row.sku, name: row.name, vendor: row.vendor,
+      cat: row.category, unit: row.unit,
+      price: parseFloat(row.price), prev: parseFloat(row.prev_price || row.price),
+      _edited: true
+    });
+    showSaveToast(row.name + ' added to catalog', '#16a34a');
+    renderIngredients && renderIngredients();
+  }).catch(function(e) {
+    showSaveToast('Add failed: ' + e.message, '#dc2626');
+  });
 }
 
 function resetInvoiceUpload() {
@@ -3650,6 +3735,57 @@ function resetInvoiceUpload() {
   document.getElementById('invoice-parsing-status').style.display = 'none';
   document.getElementById('invoice-review').style.display = 'none';
   document.getElementById('invoice-file-input').value = '';
+}
+
+// Show the just-uploaded invoice (image or PDF) in a modal viewer.
+function viewCurrentInvoice() {
+  var dataUrl   = window._currentInvoiceDataUrl;
+  var mediaType = window._currentInvoiceMediaType;
+  var fileName  = window._currentInvoiceFileName || 'invoice';
+  if (!dataUrl) {
+    showSaveToast('No invoice loaded to view yet.', '#d97706');
+    return;
+  }
+  var modal  = document.getElementById('invoice-viewer-modal');
+  var body   = document.getElementById('invoice-viewer-body');
+  var title  = document.getElementById('invoice-viewer-title');
+  var dlLink = document.getElementById('invoice-viewer-download');
+
+  title.textContent = fileName;
+  dlLink.href = dataUrl;
+  dlLink.setAttribute('download', fileName);
+
+  body.innerHTML = '';
+  if (mediaType === 'application/pdf') {
+    var iframe = document.createElement('iframe');
+    iframe.src = dataUrl;
+    iframe.style.cssText = 'width:100%;height:80vh;border:0;background:#fff';
+    body.appendChild(iframe);
+  } else {
+    // Image — let it scroll if larger than viewport.
+    var img = document.createElement('img');
+    img.src = dataUrl;
+    img.alt = fileName;
+    img.style.cssText = 'max-width:100%;height:auto;display:block;margin:auto;background:#fff';
+    body.appendChild(img);
+  }
+  modal.style.display = 'flex';
+
+  // Close on Escape
+  document.addEventListener('keydown', _viewerEscHandler);
+}
+
+function closeInvoiceViewer() {
+  var modal = document.getElementById('invoice-viewer-modal');
+  if (modal) modal.style.display = 'none';
+  // Free the iframe/img reference so the data URL can be GC'd.
+  var body = document.getElementById('invoice-viewer-body');
+  if (body) body.innerHTML = '';
+  document.removeEventListener('keydown', _viewerEscHandler);
+}
+
+function _viewerEscHandler(e) {
+  if (e.key === 'Escape') closeInvoiceViewer();
 }
 
 function deleteInvoice(id) {
@@ -3683,15 +3819,49 @@ function renderInvoiceHistory() {
     el.innerHTML = '<div style="font-size:12px;color:#9ca3af">No invoices uploaded yet this session.</div>';
     return;
   }
-  el.innerHTML = invoiceHistory.map(function(inv) {
-    var scanBtn = inv.scanUrl
-      ? '<button onclick="window.open(\'' + inv.scanUrl + '\', \'_blank\')" style="background:#f59e0b;border:none;border-radius:6px;color:#fff;font-size:10px;font-weight:600;padding:3px 9px;cursor:pointer;margin-left:8px">📄 View scan</button>'
+  el.innerHTML = invoiceHistory.map(function(inv, idx) {
+    var scanBtn = inv.imagePath
+      ? '<button onclick="viewSavedInvoice(' + idx + ')" style="background:#f59e0b;border:none;border-radius:6px;color:#fff;font-size:10px;font-weight:600;padding:3px 9px;cursor:pointer;margin-left:8px">📄 View scan</button>'
       : '';
     return '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f9fafb;font-size:12px">' +
       '<div><span style="font-weight:500">' + inv.vendor + '</span><span style="color:#9ca3af"> ' + (inv.date||'') + '</span>' + scanBtn + '</div>' +
       '<div style="color:#9ca3af">' + inv.items + ' items · ' + inv.updated + ' prices updated</div>' +
     '</div>';
-  }).join('');;
+  }).join('');
+}
+
+// Open a saved invoice's scan in the viewer modal using a short-lived signed URL.
+function viewSavedInvoice(idx) {
+  var inv = invoiceHistory[idx];
+  if (!inv || !inv.imagePath || !sb) return;
+  sb.storage.from('invoices').createSignedUrl(inv.imagePath, 300).then(function(res) {
+    if (res.error || !res.data || !res.data.signedUrl) {
+      showSaveToast('Could not load scan: ' + (res.error ? res.error.message : 'no URL'), '#dc2626');
+      return;
+    }
+    var modal  = document.getElementById('invoice-viewer-modal');
+    var body   = document.getElementById('invoice-viewer-body');
+    var title  = document.getElementById('invoice-viewer-title');
+    var dlLink = document.getElementById('invoice-viewer-download');
+    title.textContent = inv.vendor + ' — ' + (inv.date || '');
+    dlLink.href = res.data.signedUrl;
+    dlLink.setAttribute('download', inv.imagePath.split('/').pop());
+    body.innerHTML = '';
+    var ext = (inv.imagePath.split('.').pop() || '').toLowerCase();
+    if (ext === 'pdf') {
+      var iframe = document.createElement('iframe');
+      iframe.src = res.data.signedUrl;
+      iframe.style.cssText = 'width:100%;height:80vh;border:0;background:#fff';
+      body.appendChild(iframe);
+    } else {
+      var img = document.createElement('img');
+      img.src = res.data.signedUrl;
+      img.style.cssText = 'max-width:100%;height:auto;display:block;margin:auto;background:#fff';
+      body.appendChild(img);
+    }
+    modal.style.display = 'flex';
+    document.addEventListener('keydown', _viewerEscHandler);
+  });
 }
 
 document.addEventListener('DOMContentLoaded',function(){
@@ -3765,7 +3935,21 @@ document.addEventListener('DOMContentLoaded',function(){
         <button onclick="saveInAppSettings()" style="flex:1;background:#f59e0b;color:#fff;border:none;border-radius:8px;padding:11px;font-size:13px;font-weight:600;cursor:pointer">Save settings</button>
         <button onclick="document.getElementById('inapp-settings-modal').style.display='none'" style="background:#0f172a;color:#64748b;border:1px solid #334155;border-radius:8px;padding:11px 16px;font-size:13px;cursor:pointer">Cancel</button>
       </div>
+  <!-- INVOICE VIEWER MODAL -->
+  <div id="invoice-viewer-modal" onclick="if(event.target===this)closeInvoiceViewer()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;align-items:center;justify-content:center;padding:24px">
+    <div style="background:#fff;border-radius:12px;width:100%;max-width:1100px;max-height:92vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 64px rgba(0,0,0,0.5)">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid #e5e7eb;background:#f9fafb">
+        <div style="font-size:13px;font-weight:600;color:#111827" id="invoice-viewer-title">Original invoice</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <a id="invoice-viewer-download" download style="font-size:12px;color:#2563eb;text-decoration:none;padding:6px 10px;border-radius:6px;border:1px solid #e5e7eb">⬇ Download</a>
+          <button onclick="closeInvoiceViewer()" style="background:none;border:none;color:#6b7280;font-size:22px;cursor:pointer;line-height:1">×</button>
+        </div>
+      </div>
+      <div id="invoice-viewer-body" style="flex:1;overflow:auto;background:#1f2937;display:flex;align-items:center;justify-content:center;min-height:400px">
+        <!-- Image or PDF gets inserted here -->
+      </div>
     </div>
   </div>
+
 </body>
 </html>
